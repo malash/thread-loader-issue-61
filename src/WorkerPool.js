@@ -1,13 +1,10 @@
 /* eslint-disable no-console */
 
-import childProcess from 'child_process';
+import { Worker } from 'worker_threads';
 
 import asyncQueue from 'neo-async/queue';
-import asyncMapSeries from 'neo-async/mapSeries';
 
-import readBuffer from './readBuffer';
 import WorkerError from './WorkerError';
-import { replacer, reviver } from './serializer';
 
 const workerPath = require.resolve('./worker');
 
@@ -23,36 +20,10 @@ class PoolWorker {
     this.id = workerId;
 
     workerId += 1;
-    // Empty or invalid node args would break the child process
-    const sanitizedNodeArgs = (options.nodeArgs || []).filter((opt) => !!opt);
 
-    this.worker = childProcess.spawn(
-      process.execPath,
-      [].concat(sanitizedNodeArgs).concat(workerPath, options.parallelJobs),
-      {
-        detached: true,
-        stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
-      }
-    );
-
+    this.worker = new Worker(workerPath);
     this.worker.unref();
-
-    // This prevents a problem where the worker stdio can be undefined
-    // when the kernel hits the limit of open files.
-    // More info can be found on: https://github.com/webpack-contrib/thread-loader/issues/2
-    if (!this.worker.stdio) {
-      throw new Error(
-        `Failed to create the worker pool with workerId: ${workerId} and ${''}configuration: ${JSON.stringify(
-          options
-        )}. Please verify if you hit the OS open files limit.`
-      );
-    }
-
-    const [, , , readPipe, writePipe] = this.worker.stdio;
-    this.readPipe = readPipe;
-    this.writePipe = writePipe;
-    this.listenStdOutAndErrFromWorker(this.worker.stdout, this.worker.stderr);
-    this.readNextMessage();
+    this.worker.on('message', this.onWorkerMessage.bind(this));
   }
 
   listenStdOutAndErrFromWorker(workerStdout, workerStderr) {
@@ -62,16 +33,6 @@ class PoolWorker {
 
     if (workerStderr) {
       workerStderr.on('data', this.writeToStderr);
-    }
-  }
-
-  ignoreStdOutAndErrFromWorker(workerStdout, workerStderr) {
-    if (workerStdout) {
-      workerStdout.removeListener('data', this.writeToStdout);
-    }
-
-    if (workerStderr) {
-      workerStderr.removeListener('data', this.writeToStderr);
     }
   }
 
@@ -92,10 +53,20 @@ class PoolWorker {
     this.nextJobId += 1;
     this.jobs[jobId] = { data, callback };
     this.activeJobs += 1;
+    const dataToPost = {
+      loaders: data.loaders,
+      resource: data.resource,
+      sourceMap: data.sourceMap,
+      target: data.target,
+      minimize: data.minimize,
+      resourceQuery: data.resourceQuery,
+      optionsContext: data.optionsContext,
+      rootContext: data.rootContext,
+    };
     this.writeJson({
       type: 'job',
       id: jobId,
-      data,
+      data: dataToPost,
     });
   }
 
@@ -107,105 +78,32 @@ class PoolWorker {
   }
 
   writeJson(data) {
-    const lengthBuffer = Buffer.alloc(4);
-    const messageBuffer = Buffer.from(JSON.stringify(data, replacer), 'utf-8');
-    lengthBuffer.writeInt32BE(messageBuffer.length, 0);
-    this.writePipe.write(lengthBuffer);
-    this.writePipe.write(messageBuffer);
+    this.worker.postMessage(data);
   }
 
-  writeEnd() {
-    const lengthBuffer = Buffer.alloc(4);
-    lengthBuffer.writeInt32BE(0, 0);
-    this.writePipe.write(lengthBuffer);
-  }
-
-  readNextMessage() {
-    this.state = 'read length';
-    this.readBuffer(4, (lengthReadError, lengthBuffer) => {
-      if (lengthReadError) {
-        console.error(
-          `Failed to communicate with worker (read length) ${lengthReadError}`
-        );
-        return;
-      }
-      this.state = 'length read';
-      const length = lengthBuffer.readInt32BE(0);
-
-      this.state = 'read message';
-      this.readBuffer(length, (messageError, messageBuffer) => {
-        if (messageError) {
-          console.error(
-            `Failed to communicate with worker (read message) ${messageError}`
-          );
-          return;
-        }
-        this.state = 'message read';
-        const messageString = messageBuffer.toString('utf-8');
-        const message = JSON.parse(messageString, reviver);
-        this.state = 'process message';
-        this.onWorkerMessage(message, (err) => {
-          if (err) {
-            console.error(
-              `Failed to communicate with worker (process message) ${err}`
-            );
-            return;
-          }
-          this.state = 'soon next';
-          setImmediate(() => this.readNextMessage());
-        });
-      });
-    });
-  }
-
-  onWorkerMessage(message, finalCallback) {
+  onWorkerMessage(message) {
     const { type, id } = message;
     switch (type) {
       case 'job': {
-        const { data, error, result } = message;
-        asyncMapSeries(
-          data,
-          (length, callback) => this.readBuffer(length, callback),
-          (eachErr, buffers) => {
-            const { callback: jobCallback } = this.jobs[id];
-            const callback = (err, arg) => {
-              if (jobCallback) {
-                delete this.jobs[id];
-                this.activeJobs -= 1;
-                this.onJobDone();
-                if (err) {
-                  jobCallback(err instanceof Error ? err : new Error(err), arg);
-                } else {
-                  jobCallback(null, arg);
-                }
-              }
-              finalCallback();
-            };
-            if (eachErr) {
-              callback(eachErr);
-              return;
+        const { error, result } = message;
+        const { callback: jobCallback } = this.jobs[id];
+        const callback = (err, arg) => {
+          if (jobCallback) {
+            delete this.jobs[id];
+            this.activeJobs -= 1;
+            this.onJobDone();
+            if (err) {
+              jobCallback(err instanceof Error ? err : new Error(err), arg);
+            } else {
+              jobCallback(null, arg);
             }
-            let bufferPosition = 0;
-            if (result.result) {
-              result.result = result.result.map((r) => {
-                if (r.buffer) {
-                  const buffer = buffers[bufferPosition];
-                  bufferPosition += 1;
-                  if (r.string) {
-                    return buffer.toString('utf-8');
-                  }
-                  return buffer;
-                }
-                return r.data;
-              });
-            }
-            if (error) {
-              callback(this.fromErrorObj(error), result);
-              return;
-            }
-            callback(null, result);
           }
-        );
+        };
+        if (error) {
+          callback(this.fromErrorObj(error), result);
+          return;
+        }
+        callback(null, result);
         break;
       }
       case 'loadModule': {
@@ -231,7 +129,6 @@ class PoolWorker {
             ],
           });
         });
-        finalCallback();
         break;
       }
       case 'resolve': {
@@ -268,26 +165,22 @@ class PoolWorker {
             });
           });
         }
-        finalCallback();
         break;
       }
       case 'emitWarning': {
         const { data } = message;
         const { data: jobData } = this.jobs[id];
         jobData.emitWarning(this.fromErrorObj(data));
-        finalCallback();
         break;
       }
       case 'emitError': {
         const { data } = message;
         const { data: jobData } = this.jobs[id];
         jobData.emitError(this.fromErrorObj(data));
-        finalCallback();
         break;
       }
       default: {
         console.error(`Unexpected worker message ${type} in WorkerPool.`);
-        finalCallback();
         break;
       }
     }
@@ -303,15 +196,10 @@ class PoolWorker {
     return new WorkerError(obj, this.id);
   }
 
-  readBuffer(length, callback) {
-    readBuffer(this.readPipe, length, callback);
-  }
-
   dispose() {
     if (!this.disposed) {
       this.disposed = true;
-      this.ignoreStdOutAndErrFromWorker(this.worker.stdout, this.worker.stderr);
-      this.writeEnd();
+      this.worker.terminate();
     }
   }
 }

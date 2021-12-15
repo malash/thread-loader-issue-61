@@ -4,75 +4,17 @@ import NativeModule from 'module';
 
 import querystring from 'querystring';
 
+import { parentPort } from 'worker_threads';
+
 import loaderRunner from 'loader-runner';
 import asyncQueue from 'neo-async/queue';
 import parseJson from 'json-parse-better-errors';
 import { validate } from 'schema-utils';
 
-import readBuffer from './readBuffer';
-import { replacer, reviver } from './serializer';
-
-const writePipe = fs.createWriteStream(null, { fd: 3 });
-const readPipe = fs.createReadStream(null, { fd: 4 });
-
-writePipe.on('finish', onTerminateWrite);
-readPipe.on('end', onTerminateRead);
-writePipe.on('close', onTerminateWrite);
-readPipe.on('close', onTerminateRead);
-
-readPipe.on('error', onError);
-writePipe.on('error', onError);
-
 const PARALLEL_JOBS = +process.argv[2] || 20;
 
-let terminated = false;
 let nextQuestionId = 0;
 const callbackMap = Object.create(null);
-
-function onError(error) {
-  console.error(error);
-}
-
-function onTerminateRead() {
-  terminateRead();
-}
-
-function onTerminateWrite() {
-  terminateWrite();
-}
-
-function writePipeWrite(...args) {
-  if (!terminated) {
-    writePipe.write(...args);
-  }
-}
-
-function writePipeCork() {
-  if (!terminated) {
-    writePipe.cork();
-  }
-}
-
-function writePipeUncork() {
-  if (!terminated) {
-    writePipe.uncork();
-  }
-}
-
-function terminateRead() {
-  terminated = true;
-  readPipe.removeAllListeners();
-}
-
-function terminateWrite() {
-  terminated = true;
-  writePipe.removeAllListeners();
-}
-
-function terminate() {
-  terminateRead();
-  terminateWrite();
-}
 
 function toErrorObj(err) {
   return {
@@ -91,18 +33,8 @@ function toNativeError(obj) {
   return err;
 }
 
-function writeJson(data) {
-  writePipeCork();
-  process.nextTick(() => {
-    writePipeUncork();
-  });
-
-  const lengthBuffer = Buffer.alloc(4);
-  const messageBuffer = Buffer.from(JSON.stringify(data, replacer), 'utf-8');
-  lengthBuffer.writeInt32BE(messageBuffer.length, 0);
-
-  writePipeWrite(lengthBuffer);
-  writePipeWrite(messageBuffer);
+function writeJson(data, transferList = []) {
+  parentPort.postMessage(data, transferList);
 }
 
 const queue = asyncQueue(({ id, data }, taskCallback) => {
@@ -256,46 +188,31 @@ const queue = asyncQueue(({ id, data }, taskCallback) => {
           contextDependencies,
           missingDependencies,
         } = lrResult;
-        const buffersToSend = [];
-        const convertedResult =
-          Array.isArray(result) &&
-          result.map((item) => {
-            const isBuffer = Buffer.isBuffer(item);
-            if (isBuffer) {
-              buffersToSend.push(item);
-              return {
-                buffer: true,
-              };
-            }
-            if (typeof item === 'string') {
-              const stringBuffer = Buffer.from(item, 'utf-8');
-              buffersToSend.push(stringBuffer);
-              return {
-                buffer: true,
-                string: true,
-              };
-            }
-            return {
-              data: item,
-            };
-          });
-        writeJson({
-          type: 'job',
-          id,
-          error: err && toErrorObj(err),
-          result: {
-            result: convertedResult,
-            cacheable,
-            fileDependencies,
-            contextDependencies,
-            missingDependencies,
-            buildDependencies,
+        const transferList = [];
+        // TODO: seems no loader returns Buffer
+        // if (Array.isArray(result)) {
+        //   for (const item of result) {
+        //     if (Buffer.isBuffer(item)) {
+        //       transferList.push(item);
+        //     }
+        //   }
+        // }
+        writeJson(
+          {
+            type: 'job',
+            id,
+            error: err && toErrorObj(err),
+            result: {
+              result,
+              cacheable,
+              fileDependencies,
+              contextDependencies,
+              missingDependencies,
+              buildDependencies,
+            },
           },
-          data: buffersToSend.map((buffer) => buffer.length),
-        });
-        buffersToSend.forEach((buffer) => {
-          writePipeWrite(buffer);
-        });
+          transferList
+        );
         setImmediate(taskCallback);
       }
     );
@@ -308,13 +225,6 @@ const queue = asyncQueue(({ id, data }, taskCallback) => {
     taskCallback();
   }
 }, PARALLEL_JOBS);
-
-function dispose() {
-  terminate();
-
-  queue.kill();
-  process.exit(0);
-}
 
 function onMessage(message) {
   try {
@@ -352,41 +262,4 @@ function onMessage(message) {
   }
 }
 
-function readNextMessage() {
-  readBuffer(readPipe, 4, (lengthReadError, lengthBuffer) => {
-    if (lengthReadError) {
-      console.error(
-        `Failed to communicate with main process (read length) ${lengthReadError}`
-      );
-      return;
-    }
-
-    const length = lengthBuffer.length && lengthBuffer.readInt32BE(0);
-
-    if (length === 0) {
-      // worker should dispose and exit
-      dispose();
-      return;
-    }
-    readBuffer(readPipe, length, (messageError, messageBuffer) => {
-      if (terminated) {
-        return;
-      }
-
-      if (messageError) {
-        console.error(
-          `Failed to communicate with main process (read message) ${messageError}`
-        );
-        return;
-      }
-      const messageString = messageBuffer.toString('utf-8');
-      const message = JSON.parse(messageString, reviver);
-
-      onMessage(message);
-      setImmediate(() => readNextMessage());
-    });
-  });
-}
-
-// start reading messages from main process
-readNextMessage();
+parentPort.on('message', onMessage);
