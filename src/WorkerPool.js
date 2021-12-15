@@ -53,7 +53,7 @@ class PoolWorker {
     this.nextJobId += 1;
     this.jobs[jobId] = { data, callback };
     this.activeJobs += 1;
-    const dateToPost = {
+    const dataToPost = {
       loaders: data.loaders,
       resource: data.resource,
       sourceMap: data.sourceMap,
@@ -66,7 +66,7 @@ class PoolWorker {
     this.writeJson({
       type: 'job',
       id: jobId,
-      data: dateToPost,
+      data: dataToPost,
     });
   }
 
