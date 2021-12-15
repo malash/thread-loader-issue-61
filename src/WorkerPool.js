@@ -23,7 +23,6 @@ class PoolWorker {
 
     this.worker = new Worker(workerPath);
     this.worker.unref();
-    this.messageBuffer = [];
     this.worker.on('message', this.onWorkerMessage.bind(this));
   }
 
